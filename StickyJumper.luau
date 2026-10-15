@@ -12,10 +12,10 @@
 -- Stack a few in one spot for a stronger blast.
 --
 -- Bombs leave the barrel: they spawn at the launcher's muzzle and fly out
--- along your crosshair. In first person and shift lock the launcher itself
--- turns to follow the camera, so the barrel points wherever you aim; the rest
--- of the time it just rides the hand. It also has a little screen (speed +
--- charge meter) that you can read in first person.
+-- along your crosshair. In first person the launcher itself turns to follow the
+-- camera, so the barrel points wherever you aim; the rest of the time it just
+-- rides the hand. On its LEFT face it has a little screen (speed + charge, and
+-- the RightShift colour picker) that you can read in first person.
 --
 -- All of it is local. No damage to you or anyone else, no knockback for other
 -- players, and only you can see the stickies and the explosions.
@@ -34,6 +34,21 @@ local TweenService = game:GetService("TweenService")
 local SoundService = game:GetService("SoundService")
 
 local player = Players.LocalPlayer
+
+-- JetBrains Mono isn't exposed as an Enum.Font member on every client build, so
+-- reach it through a FontFace instead and fall back to the built-in monospace
+-- enum if even that is unavailable. useMono() applies it to any text object.
+local MONO_FACE = nil
+pcall(function()
+	MONO_FACE = Font.new("rbxasset://fonts/families/JetBrainsMono.json")
+end)
+
+local function useMono(obj)
+	if MONO_FACE then
+		if pcall(function() obj.FontFace = MONO_FACE end) then return end
+	end
+	pcall(function() obj.Font = Enum.Font.RobotoMono end)
+end
 
 local CONFIG = {
 	enabled   = true,
@@ -58,6 +73,7 @@ local CONFIG = {
 	blast = {
 		radius      = 16,   -- blast reach; past this there's no launch
 		speed       = 235,  -- blast impulse speed
+		maxSpeed    = 260,  -- cap on the blast's own push, so big stacks stay sane
 		aimUp       = 0,    -- extra upward tilt on the push (TF2 has none)
 		minUp       = 70,   -- never give less than this much upward speed
 		-- TF2 sends you along the line from the bomb to your body, full stop.
@@ -66,10 +82,28 @@ local CONFIG = {
 		fxTime      = 0.5,  -- how long the blast visual lasts
 		stackRadius = 4,    -- stickies within this many studs count as one blast
 		stackBonus  = 0.6,  -- extra power per sticky stacked in the same spot
+		maxStack    = 2.2,  -- ceiling on the stacked multiplier, so 8 bombs don't nuke you
+		-- How much of the speed you already had survives the blast. 0 = the bomb
+		-- fully overrides your momentum, 1 = it only ever adds. A little carry
+		-- keeps a running start (or a previous jump) worth having.
+		momentum    = 0.35,
+		-- Blast "grace": the launch is shielded from ground friction and the
+		-- velocity resync for this long, so blowing up a bomb at your feet
+		-- actually lifts you off instead of being braked back down the same frame.
+		hold        = 0.18,
+		-- The movement controller caps horizontal speed. A blast may exceed that
+		-- cap; the extra bleeds off over roughly half a second (ceilingDecay
+		-- studs/s per second) rather than snapping down, so the arc stays smooth.
+		ceilingDecay = 220,
 	},
 
 	parachute = {
 		enabled       = true,
+		-- Which canopy shape flies. Chosen from the picker on the launcher
+		-- screen: "classic" (gores alternating), "stripe" (white with red
+		-- stripes), "army" (one flat matte colour) or "wing" (ram-air).
+		design        = "classic",
+		designs       = { "classic", "stripe", "army", "wing" },
 		safeSpeed     = 16,   -- descent speed while the chute is open (studs/s)
 		minFallSpeed  = 20,   -- only open once you're falling faster than this
 		minFallHeight = 20,   -- ...and you've fallen at least this far (studs)
@@ -153,73 +187,126 @@ local CONFIG = {
 
 CONFIG.colors = {
 	uiOpen = false,
+	-- The launcher palette. Names match the parts buildLauncher makes, so a
+	-- recolour is a straight lookup (see applyLauncherColors).
 	launcher = {
-		primary   = Color3.fromRGB(40, 40, 45),
-		secondary = Color3.fromRGB(90, 90, 95),
-		dark      = Color3.fromRGB(20, 20, 24),
-		light     = Color3.fromRGB(220, 220, 225),
-		muzzle    = Color3.fromRGB(255, 190, 40),
-		screen    = Color3.fromRGB(40, 60, 90),
+		metal  = Color3.fromRGB(66, 68, 76),
+		dark   = Color3.fromRGB(34, 35, 40),
+		wood   = Color3.fromRGB(122, 74, 40),
+		accent = Color3.fromRGB(226, 118, 28),
 	},
+	-- The canopy palette: the gores alternate canopy/panel down the seams, so
+	-- canopy is the body and panel is the stripe.
 	parachute = {
-		canopy = Color3.fromRGB(255, 255, 255),
-		lip    = Color3.fromRGB(245, 245, 245),
-		lines  = Color3.fromRGB(40, 40, 45),
-		stripes= Color3.fromRGB(220, 40, 40),
+		canopy = Color3.fromRGB(245, 245, 248),
+		panel  = Color3.fromRGB(220, 40, 44),
+		rim    = Color3.fromRGB(34, 40, 60),
+		rib    = Color3.fromRGB(226, 230, 236),
+		cord   = Color3.fromRGB(238, 238, 238),
+		pack   = Color3.fromRGB(54, 56, 62),
+		strap  = Color3.fromRGB(28, 29, 34),
+		rip    = Color3.fromRGB(232, 140, 40),
+		glow   = Color3.fromRGB(255, 226, 130),
 	},
-	palettes = {
-		launcher = {
-			Color3.fromRGB(40, 40, 45),
-			Color3.fromRGB(60, 90, 140),
-			Color3.fromRGB(140, 60, 60),
-			Color3.fromRGB(60, 140, 80),
-			Color3.fromRGB(180, 140, 60),
-			Color3.fromRGB(90, 70, 150),
-			Color3.fromRGB(30, 30, 30),
-			Color3.fromRGB(160, 160, 170),
-		},
-		canopy = {
-			Color3.fromRGB(255, 255, 255),
-			Color3.fromRGB(240, 240, 240),
-			Color3.fromRGB(220, 40, 40),
-			Color3.fromRGB(40, 120, 220),
-			Color3.fromRGB(240, 200, 60),
-			Color3.fromRGB(120, 200, 120),
-			Color3.fromRGB(180, 80, 200),
-		},
-		lip = {
-			Color3.fromRGB(245, 245, 245),
-			Color3.fromRGB(230, 230, 230),
-			Color3.fromRGB(200, 60, 60),
-			Color3.fromRGB(60, 140, 240),
-			Color3.fromRGB(250, 220, 80),
-			Color3.fromRGB(140, 220, 140),
-			Color3.fromRGB(200, 100, 220),
-		},
-		lines = {
-			Color3.fromRGB(40, 40, 45),
-			Color3.fromRGB(20, 20, 25),
-			Color3.fromRGB(80, 20, 20),
-			Color3.fromRGB(20, 40, 80),
-			Color3.fromRGB(80, 70, 20),
-			Color3.fromRGB(30, 60, 40),
-			Color3.fromRGB(60, 30, 80),
-		},
-		stripes = {
-			Color3.fromRGB(220, 40, 40),
-			Color3.fromRGB(40, 120, 220),
-			Color3.fromRGB(240, 200, 60),
-			Color3.fromRGB(120, 200, 120),
-			Color3.fromRGB(180, 80, 200),
-			Color3.fromRGB(255, 255, 255),
-			Color3.fromRGB(40, 40, 45),
-		},
+	-- One shared ramp. Clicking a swatch steps it to the next colour here.
+	palette = {
+		Color3.fromRGB(66, 68, 76),
+		Color3.fromRGB(34, 35, 40),
+		Color3.fromRGB(122, 74, 40),
+		Color3.fromRGB(226, 118, 28),
+		Color3.fromRGB(245, 245, 248),
+		Color3.fromRGB(220, 40, 44),
+		Color3.fromRGB(40, 120, 220),
+		Color3.fromRGB(240, 200, 60),
+		Color3.fromRGB(120, 200, 120),
+		Color3.fromRGB(180, 80, 200),
+		Color3.fromRGB(34, 40, 60),
+		Color3.fromRGB(28, 29, 34),
 	},
 }
 
-local VERSION = "1.68"
+local VERSION = "1.73"
 
 local genv = (getgenv and getgenv()) or _G
+
+-- Settings persistence ---------------------------------------------------------
+--
+-- Your paint job survives re-running the script. The launcher/parachute colours
+-- and the chosen canopy shape are written to a tiny text file in the executor's
+-- workspace (StickyJumper.cfg) and read back on start-up, before the launcher
+-- and parachute are built, so the first build already comes up in your colours.
+-- Executors without a filesystem fall back to getgenv(), which still carries the
+-- settings across executions inside one session.
+
+local SETTINGS_FILE = "StickyJumper.cfg"
+
+local function settingsSerialise()
+	local lines = {}
+	local function dump(group)
+		for key, value in pairs(CONFIG.colors[group]) do
+			if typeof(value) == "Color3" then
+				lines[#lines + 1] = string.format("%s.%s=%d,%d,%d", group, key,
+					math.floor(value.R * 255 + 0.5),
+					math.floor(value.G * 255 + 0.5),
+					math.floor(value.B * 255 + 0.5))
+			end
+		end
+	end
+	dump("launcher")
+	dump("parachute")
+	lines[#lines + 1] = "design=" .. tostring(CONFIG.parachute.design)
+	return table.concat(lines, "\n")
+end
+
+local function settingsApply(text)
+	if type(text) ~= "string" or text == "" then return false end
+	local changed = false
+	for group, key, r, g, b in text:gmatch("([%a_]+)%.([%a_]+)=(%d+),(%d+),(%d+)") do
+		local bucket = CONFIG.colors[group]
+		if bucket and typeof(bucket[key]) == "Color3" then
+			bucket[key] = Color3.fromRGB(tonumber(r), tonumber(g), tonumber(b))
+			changed = true
+		end
+	end
+	local design = text:match("design=([%a_]+)")
+	if design and table.find(CONFIG.parachute.designs, design) then
+		CONFIG.parachute.design = design
+		changed = true
+	end
+	return changed
+end
+
+local function saveSettings()
+	local text = settingsSerialise()
+	genv.__SJ_SETTINGS = text
+	pcall(function()
+		if typeof(writefile) == "function" then writefile(SETTINGS_FILE, text) end
+	end)
+end
+
+local function loadSettings()
+	local data
+	pcall(function()
+		if typeof(isfile) == "function" and isfile(SETTINGS_FILE)
+			and typeof(readfile) == "function" then
+			data = readfile(SETTINGS_FILE)
+		end
+	end)
+	if type(data) ~= "string" then data = genv.__SJ_SETTINGS end
+	return settingsApply(data)
+end
+
+local function resetSettings()
+	genv.__SJ_SETTINGS = nil
+	pcall(function()
+		if typeof(delfile) == "function" and typeof(isfile) == "function" and isfile(SETTINGS_FILE) then
+			delfile(SETTINGS_FILE)
+		end
+	end)
+end
+
+-- Bring back the previous session's colours before anything is built.
+local settingsLoaded = loadSettings()
 
 -- Let an older copy unload before we take over. Re-running the same version
 -- does nothing instead of tearing everything down and rebuilding it.
@@ -453,19 +540,28 @@ local function launchPlayer(position, powerScale)
 	if dir.Magnitude < 1e-3 then dir = Vector3.new(0, 1, 0) end
 	dir = dir.Unit
 
-	local speed = CONFIG.blast.speed * falloff * powerScale
-	local upSpeed = math.max(dir.Y * speed, CONFIG.blast.minUp * falloff * powerScale)
+	local power = math.min(powerScale, CONFIG.blast.maxStack)
+	local speed = math.min(CONFIG.blast.speed * falloff * power, CONFIG.blast.maxSpeed)
+	local upSpeed = math.max(dir.Y * speed, CONFIG.blast.minUp * falloff * power)
 
 	releaseMoves()
 
 	hum:ChangeState(Enum.HumanoidStateType.Freefall)
 	local vel = hrp.AssemblyLinearVelocity
-	local nx = vel.X * 0.3 + dir.X * speed
-	local nz = vel.Z * 0.3 + dir.Z * speed
-	hrp.AssemblyLinearVelocity = Vector3.new(nx, math.max(upSpeed, vel.Y * 0.3 + dir.Y * speed), nz)
+	local keep = CONFIG.blast.momentum     -- how much of our old speed rides along
+	local nx = vel.X * keep + dir.X * speed
+	local nz = vel.Z * keep + dir.Z * speed
+	hrp.AssemblyLinearVelocity = Vector3.new(nx, math.max(upSpeed, vel.Y * keep + dir.Y * speed), nz)
 	-- Hand the launch to the movement controller so its velocity constraint
-	-- keeps the speed instead of dragging it back down.
-	if smState then smState.hv = Vector3.new(nx, 0, nz) end
+	-- keeps the speed instead of dragging it back down, and shield it from the
+	-- ground for a beat so a bomb at our feet actually lifts us off instead of
+	-- being braked away the same frame. The blast also lifts the speed cap; the
+	-- extra bleeds off smoothly rather than snapping.
+	if smState then
+		smState.hv = Vector3.new(nx, 0, nz)
+		smState.blastHold = CONFIG.blast.hold
+		smState.softCeil = math.max(smState.softCeil or 0, math.sqrt(nx * nx + nz * nz))
+	end
 
 	local launched = math.sqrt(nx * nx + nz * nz)
 	if launched > stats.best then stats.best = launched end
@@ -566,6 +662,7 @@ end
 
 local function startStickyCharge()
 	if not enabled or stickyCharging then return end
+	if CONFIG.colors and CONFIG.colors.uiOpen then return end
 	stickyCharging = true
 	stickyChargeStart = os.clock()
 end
@@ -869,7 +966,7 @@ local launcherScreen = nil
 local function buildLauncherScreen(parent)
 	local gui = Instance.new("SurfaceGui")
 	gui.Name = "LauncherScreen"
-	gui.Face = Enum.NormalId.Back       -- the panel face, leaning back at your eye
+	gui.Face = Enum.NormalId.Back       -- painted on the panel's outward face
 	gui.SizingMode = Enum.SurfaceGuiSizingMode.PixelsPerStud
 	gui.PixelsPerStud = 300            -- enough canvas to keep text crisp
 	gui.LightInfluence = 0             -- self-lit, like a real screen
@@ -898,7 +995,7 @@ local function buildLauncherScreen(parent)
 		l.BackgroundTransparency = 1
 		l.Position = pos
 		l.Size = size
-		l.Font = Enum.Font.GothamBold
+		useMono(l)
 		l.TextScaled = true
 		l.TextXAlignment = align
 		l.TextColor3 = color
@@ -943,11 +1040,16 @@ local function buildLauncherScreen(parent)
 	fc.CornerRadius = UDim.new(0, 4)
 	fc.Parent = fill
 
-	return { gui = gui, value = value, fill = fill }
+	return { gui = gui, value = value, fill = fill, part = parent }
 end
 
 local function buildLauncher(parent)
-	local m = LAUNCHER
+	local m = {
+		metal  = CONFIG.colors.launcher.metal,
+		dark   = CONFIG.colors.launcher.dark,
+		wood   = CONFIG.colors.launcher.wood,
+		orange = CONFIG.colors.launcher.accent,
+	}
 
 	local function mk(name, size, cf, color, material, shape)
 		local p = Instance.new("Part")
@@ -978,39 +1080,82 @@ local function buildLauncher(parent)
 	local parts = {}
 	local function add(p) parts[#parts + 1] = p return p end
 
-	-- grip / trigger / body
-	add(mk("Grip", Vector3.new(0.26, 1.0, 0.5), CFrame.new(0, -0.62, 0.2) * CFrame.Angles(math.rad(-14), 0, 0), m.dark, Enum.Material.SmoothPlastic))
-	add(mk("TriggerGuard", Vector3.new(0.16, 0.34, 0.5), CFrame.new(0, -0.3, -0.12), m.metal))
-	add(mk("Body", Vector3.new(0.54, 0.74, 1.7), CFrame.new(0, 0.18, -0.15), m.metal))
+	-- grip / trigger / receiver ------------------------------------------------
+	-- Three stacked tiers (receiver, top deck, lower housing) instead of one
+	-- crate, so the body reads as milled rather than boxed.
+	add(mk("Body", Vector3.new(0.54, 0.68, 1.6), CFrame.new(0, 0.16, -0.15), m.metal))
+	add(mk("TopDeck", Vector3.new(0.5, 0.1, 1.5), CFrame.new(0, 0.55, -0.15), m.dark))
+	add(mk("LowerHousing", Vector3.new(0.44, 0.32, 0.9), CFrame.new(0, -0.2, -0.3), m.metal))
 
-	-- wooden stock with an orange cheek piece
-	add(mk("Stock", Vector3.new(0.4, 0.66, 1.05), CFrame.new(0, -0.06, 1.0) * CFrame.Angles(math.rad(7), 0, 0), m.wood, Enum.Material.Wood))
+	-- a proper top rail with teeth
+	add(mk("TopRail", Vector3.new(0.24, 0.06, 1.1), CFrame.new(0, 0.63, -0.3), m.dark))
+	for i = 0, 3 do
+		add(mk("RailTooth", Vector3.new(0.28, 0.035, 0.06), CFrame.new(0, 0.67, -0.75 + i * 0.3), m.dark))
+	end
+
+	-- pistol grip, trigger group
+	local gripRot = CFrame.Angles(math.rad(-14), 0, 0)
+	add(mk("Grip", Vector3.new(0.26, 1.0, 0.5), CFrame.new(0, -0.62, 0.2) * gripRot, m.dark, Enum.Material.SmoothPlastic))
+	add(mk("GripCap", Vector3.new(0.3, 0.1, 0.54), CFrame.new(0, -1.1, 0.32) * gripRot, m.metal))
+	add(mk("TriggerGuard", Vector3.new(0.14, 0.3, 0.46), CFrame.new(0, -0.36, -0.1), m.metal))
+	add(mk("Trigger", Vector3.new(0.06, 0.17, 0.05), CFrame.new(0, -0.3, -0.16), m.orange, Enum.Material.SmoothPlastic))
+
+	-- wooden shoulder stock: comb, orange cheek riser and a steel butt plate
+	local stockRot = CFrame.Angles(math.rad(7), 0, 0)
+	add(mk("Stock", Vector3.new(0.4, 0.66, 1.05), CFrame.new(0, -0.06, 1.0) * stockRot, m.wood, Enum.Material.Wood))
+	add(mk("Comb", Vector3.new(0.32, 0.14, 0.9), CFrame.new(0, 0.24, 1.0) * stockRot, m.wood, Enum.Material.Wood))
 	add(mk("CheekPiece", Vector3.new(0.32, 0.16, 1.0), CFrame.new(0, 0.31, 1.0), m.orange, Enum.Material.SmoothPlastic))
+	add(mk("ButtPlate", Vector3.new(0.42, 0.72, 0.1), CFrame.new(0, -0.06, 1.55) * stockRot, m.dark, Enum.Material.Metal))
 
-	-- top sight
-	add(mk("Sight", Vector3.new(0.12, 0.36, 0.16), CFrame.new(0, 0.68, -0.35), m.dark))
-	add(mk("SightRail", Vector3.new(0.22, 0.1, 0.56), CFrame.new(0, 0.86, -0.35), m.dark))
+	-- iron sights
+	add(mk("FrontSight", Vector3.new(0.05, 0.2, 0.06), CFrame.new(0, 0.55, -1.78), m.dark))
+	add(mk("RearSightBase", Vector3.new(0.3, 0.06, 0.18), CFrame.new(0, 0.62, 0.42), m.dark))
+	add(mk("RearSightL", Vector3.new(0.05, 0.12, 0.18), CFrame.new(-0.09, 0.7, 0.42), m.dark))
+	add(mk("RearSightR", Vector3.new(0.05, 0.12, 0.18), CFrame.new(0.09, 0.7, 0.42), m.dark))
 
-	-- sticky drum (big cylinder along the barrel) + orange band
-	add(mk("Drum", Vector3.new(0.95, 1.16, 1.16), CFrame.new(0, -0.02, -0.95) * y90, m.dark, Enum.Material.Metal, Enum.PartType.Cylinder))
-	add(mk("DrumBand", Vector3.new(0.22, 1.24, 1.24), CFrame.new(0, -0.02, -1.4) * y90, m.orange, Enum.Material.SmoothPlastic, Enum.PartType.Cylinder))
+	-- sticky drum: a fat fore-aft cylinder, ringed in orange, with six sticky
+	-- bombs visible on its face so it reads as a loaded magazine rather than a
+	-- plain tube.
+	add(mk("Drum", Vector3.new(0.8, 1.1, 1.1), CFrame.new(0, -0.02, -1.28) * y90, m.dark, Enum.Material.Metal, Enum.PartType.Cylinder))
+	add(mk("DrumFace", Vector3.new(0.06, 1.0, 1.0), CFrame.new(0, -0.02, -1.66) * y90, m.metal, Enum.Material.Metal, Enum.PartType.Cylinder))
+	add(mk("DrumHub", Vector3.new(0.16, 0.24, 0.24), CFrame.new(0, -0.02, -1.71) * y90, m.metal, Enum.Material.Metal, Enum.PartType.Cylinder))
+	add(mk("DrumBand", Vector3.new(0.1, 1.16, 1.16), CFrame.new(0, -0.02, -1.6) * y90, m.orange, Enum.Material.SmoothPlastic, Enum.PartType.Cylinder))
+	add(mk("DrumBand", Vector3.new(0.1, 1.16, 1.16), CFrame.new(0, -0.02, -0.94) * y90, m.orange, Enum.Material.SmoothPlastic, Enum.PartType.Cylinder))
+	for i = 0, 5 do
+		local a = i * math.pi / 3
+		add(mk("DrumBomb", Vector3.new(0.2, 0.2, 0.2),
+			CFrame.new(math.cos(a) * 0.33, -0.02 + math.sin(a) * 0.33, -1.73), m.orange,
+			Enum.Material.SmoothPlastic, Enum.PartType.Ball))
+	end
 
-	-- barrel + muzzle
-	add(mk("Barrel", Vector3.new(0.95, 0.44, 0.44), CFrame.new(0, 0.22, -1.8) * y90, m.metal, Enum.Material.Metal, Enum.PartType.Cylinder))
-	add(mk("Muzzle", Vector3.new(0.24, 0.58, 0.58), CFrame.new(0, 0.22, -2.25) * y90, m.dark, Enum.Material.Metal, Enum.PartType.Cylinder))
+	-- barrel: a dark core with slotted shroud rings (the gaps are the vents),
+	-- then a muzzle with an orange collar and cap.
+	add(mk("BarrelCore", Vector3.new(0.95, 0.3, 0.3), CFrame.new(0, 0.22, -2.0) * y90, m.dark, Enum.Material.Metal, Enum.PartType.Cylinder))
+	for i = 0, 2 do
+		add(mk("ShroudRing", Vector3.new(0.13, 0.5, 0.5), CFrame.new(0, 0.22, -1.78 - i * 0.2) * y90, m.metal, Enum.Material.Metal, Enum.PartType.Cylinder))
+	end
+	add(mk("Muzzle", Vector3.new(0.28, 0.46, 0.46), CFrame.new(0, 0.22, -2.46) * y90, m.dark, Enum.Material.Metal, Enum.PartType.Cylinder))
+	add(mk("MuzzleRing", Vector3.new(0.07, 0.52, 0.52), CFrame.new(0, 0.22, -2.34) * y90, m.orange, Enum.Material.SmoothPlastic, Enum.PartType.Cylinder))
+	add(mk("MuzzleTip", Vector3.new(0.09, 0.4, 0.4), CFrame.new(0, 0.22, -2.62) * y90, m.orange, Enum.Material.SmoothPlastic, Enum.PartType.Cylinder))
 
-	-- muzzle tip (orange, so it reads as the Sticky Jumper)
-	add(mk("MuzzleTip", Vector3.new(0.1, 0.66, 0.66), CFrame.new(0, 0.22, -2.4) * y90, m.orange, Enum.Material.SmoothPlastic, Enum.PartType.Cylinder))
-
-	-- The screen: a flat panel on the back of the receiver, leaning back so its
-	-- face looks up at your eye. The readout is a SurfaceGui painted onto that
-	-- face, so the numbers are ON the model - the bezel frames it, the gun's own
-	-- body occludes it, and it never floats in front of the weapon.
-	local screenCf = CFrame.new(0, 0.64, 0.3) * CFrame.Angles(math.rad(-32), 0, 0)
-	add(mk("ScreenBezel", Vector3.new(0.58, 0.42, 0.06), screenCf * CFrame.new(0, 0, -0.05),
+	-- The screen: a flat panel bolted to the LEFT side of the receiver and lying
+	-- flush with it. Held in first person the gun rides the lower-right of the
+	-- view, so this face looks away from you during normal play - which is what
+	-- you wanted: it is a proper side panel, not something angled into your eye.
+	-- Pressing RightShift swings the whole launcher round so this panel turns to
+	-- face you (see the aim step). The part is turned ninety degrees about local
+	-- Y so its Back face - where the SurfaceGui is - points out to the gun's
+	-- left. Long down the receiver and a little taller than the body, so there is
+	-- room for a real readout.
+	local screenCf = CFrame.new(-0.3, 0.15, -0.1) * CFrame.Angles(0, math.rad(-90), 0)
+	add(mk("ScreenBezel", Vector3.new(1.38, 0.64, 0.06), screenCf * CFrame.new(0, 0, -0.05),
 		m.orange, Enum.Material.SmoothPlastic))
-	local screen = add(mk("Screen", Vector3.new(0.52, 0.36, 0.05), screenCf,
+	local screen = add(mk("Screen", Vector3.new(1.3, 0.56, 0.05), screenCf,
 		m.dark, Enum.Material.SmoothPlastic))
+	-- Let the mouse ray hit the panel; the launcher's parts are unqueryable
+	-- (CanQuery = false) so the cursor passes through them, and a SurfaceGui only
+	-- receives clicks on a part the ray can actually strike.
+	screen.CanQuery = true
 
 	launcherScreen = buildLauncherScreen(screen)
 
@@ -1051,19 +1196,20 @@ local function shiftLocked()
 	return behaviour == Enum.MouseBehavior.LockCenter or behaviour == Enum.MouseBehavior.LockCurrentPosition
 end
 
--- The two camera modes where you are genuinely AIMING: first person, and shift
--- lock. Both point your body at the crosshair; plain third person does not.
+-- The launcher turns to the camera in FIRST PERSON only. Shift lock gives the
+-- same aim, but the gun reads fine riding the arm there and following in shift
+-- lock just wobbled it around.
 local function aimingCamera()
 	return inFirstPerson()
 end
 
--- Detonating is an aimed action: it belongs to those same two camera modes,
--- where you are actually pointing the launcher at what you mean to blow up.
--- Wandering around in plain third person, a stray RMB must not set the bombs off
--- under your own feet. Firing is untouched: LMB still lobs stickies from any
--- camera.
+-- Detonating is an aimed action, though: it belongs to either of the two modes
+-- where you are genuinely pointing the launcher at something - first person, and
+-- shift lock. Wandering around in plain third person, a stray RMB must not set
+-- the bombs off under your own feet. Firing is untouched: LMB still lobs stickies
+-- from any camera.
 local function detonateArmed()
-	return aimingCamera()
+	return inFirstPerson() or shiftLocked()
 end
 
 -- charge bar (bottom-centre, like TF2's sticky charge meter) ----------------
@@ -1082,8 +1228,8 @@ local function buildChargeBar()
 
 	local back = Instance.new("Frame")
 	back.Name = "Back"
-	back.AnchorPoint = Vector2.new(0.5, 1)
-	back.Position = UDim2.new(0.5, 0, 1, -150)
+	back.AnchorPoint = Vector2.new(0, 1)
+	back.Position = UDim2.new(0, 16, 1, -150)
 	back.Size = UDim2.new(0, 240, 0, 16)
 	back.BackgroundColor3 = Color3.fromRGB(18, 18, 22)
 	back.BackgroundTransparency = 0.25
@@ -1113,7 +1259,7 @@ local function buildChargeBar()
 	label.Name = "Label"
 	label.BackgroundTransparency = 1
 	label.Size = UDim2.new(1, 0, 1, 0)
-	label.Font = Enum.Font.GothamBold
+	useMono(label)
 	label.TextColor3 = Color3.fromRGB(255, 255, 255)
 	label.TextStrokeTransparency = 0.4
 	label.TextSize = 12
@@ -1155,6 +1301,28 @@ local function wireTool()
 	toolWired = true
 end
 
+local launcherRole = {
+	Body = "metal", TopDeck = "dark", LowerHousing = "metal",
+	TopRail = "dark", RailTooth = "dark",
+	Grip = "dark", GripCap = "metal", TriggerGuard = "metal", Trigger = "accent",
+	Stock = "wood", Comb = "wood", CheekPiece = "accent", ButtPlate = "dark",
+	FrontSight = "dark", RearSightBase = "dark", RearSightL = "dark", RearSightR = "dark",
+	Drum = "dark", DrumFace = "metal", DrumHub = "metal", DrumBand = "accent", DrumBomb = "accent",
+	BarrelCore = "dark", ShroudRing = "metal", Muzzle = "dark", MuzzleRing = "accent", MuzzleTip = "accent",
+	ScreenBezel = "accent", Screen = "dark",
+}
+
+local function applyLauncherColors()
+	if not launcherRoot or not launcherRoot.Parent then return end
+	-- The parts are siblings of the Handle under the Tool, not children of it.
+	for _, d in ipairs(launcherRoot.Parent:GetChildren()) do
+		if d:IsA("BasePart") and d.Name ~= "Handle" then
+			local role = launcherRole[d.Name]
+			if role then d.Color = CONFIG.colors.launcher[role] end
+		end
+	end
+end
+
 local function giveStickyTool()
 	local backpack = player:FindFirstChildOfClass("Backpack") or player:FindFirstChild("Backpack")
 	if not backpack then return end
@@ -1186,6 +1354,7 @@ local function giveStickyTool()
 	-- destroyed). It lives inside the Tool so the Tool can grip it.
 	if not launcherRoot or not launcherRoot.Parent then
 		launcherRoot = buildLauncher(stickyTool)
+		applyLauncherColors()
 	end
 end
 
@@ -1204,7 +1373,12 @@ local aimGripC0 = nil     -- its untouched C0 / C1, to restore on the way out
 local aimGripC1 = nil
 local aimDriving = false  -- are we overriding the grip right now?
 local aimLastC0 = nil     -- the last C0 we wrote (so we can skip repeats)
+local aimMenuYaw = 0      -- eased yaw that swings the screen round when the picker is open
+local AIM_MENU_YAW = 55   -- degrees to turn so the gun's left-side panel faces the camera
 
+-- The joint that holds the launcher to the hand (on a Tool that is one Weld
+-- whose Part1 is the Handle). We locate it by scanning the character rather than
+-- assuming a name, because the engine creates it when the Tool is equipped.
 local function findAimGrip()
 	local character = player.Character
 	if not character or not launcherRoot then return nil end
@@ -1228,7 +1402,7 @@ local function releaseAimGrip()
 	aimLastC0 = nil
 end
 
-local function stepLauncherAim()
+local function stepLauncherAim(dt)
 	if not launcherRoot or not launcherRoot.Parent or not stickyToolEquipped() then
 		aimGrip = nil
 		releaseAimGrip()
@@ -1247,10 +1421,9 @@ local function stepLauncherAim()
 		end
 		applyLauncherColors()
 	end
-	end
 	if not aimGrip then return end
 
-	if not (CONFIG.aim.enabled and aimingCamera()) then
+	if not (CONFIG.aim.enabled and (aimingCamera() or CONFIG.colors.uiOpen)) then
 		releaseAimGrip()
 		return
 	end
@@ -1277,6 +1450,15 @@ local function stepLauncherAim()
 		camCf = camCf * CFrame.Angles(math.rad(CONFIG.aim.pitchOffset), 0, 0)
 	end
 	local desired = CFrame.fromMatrix(restPos, camCf.RightVector, camCf.UpVector)
+
+	-- Pressing RightShift swings the launcher round so the panel bolted to its
+	-- left side turns to face you, which is the whole point of putting it on the
+	-- side. Eased, so it sweeps round rather than snapping.
+	local targetYaw = CONFIG.colors.uiOpen and AIM_MENU_YAW or 0
+	aimMenuYaw = aimMenuYaw + (targetYaw - aimMenuYaw) * math.min(1, (dt or 0.016) * 12)
+	if math.abs(aimMenuYaw) > 0.05 then
+		desired = desired * CFrame.Angles(0, math.rad(aimMenuYaw), 0)
+	end
 
 	local c0
 	if handleIsPart1 then
@@ -1329,6 +1511,8 @@ smState = {
 	holdJump = false,        -- test hook: pretend Space is held
 	ignoreKeys = false,      -- test hook: pretend no movement keys are held
 	strafeLeft = false,      -- which way the auto-strafe is currently curving
+	blastHold = 0,           -- seconds of post-blast grace (no friction / resync)
+	softCeil = 0,            -- temporary lift on the speed cap after a blast
 }
 
 -- speedometer (bottom-centre). Lives here so it can read the movement config.
@@ -1346,9 +1530,9 @@ local function buildSpeedo()
 
 	local panel = Instance.new("Frame")
 	panel.Name = "Panel"
-	panel.AnchorPoint = Vector2.new(0.5, 1)
-	-- Centre bottom, lifted just above the hotbar and below the charge meter.
-	panel.Position = UDim2.new(0.5, 0, 1, -84)
+	panel.AnchorPoint = Vector2.new(0, 1)
+	-- Left side, lifted just above the hotbar and below the charge meter.
+	panel.Position = UDim2.new(0, 16, 1, -84)
 	panel.Size = UDim2.new(0, 132, 0, 50)
 	panel.BackgroundColor3 = Color3.fromRGB(14, 14, 18)
 	panel.BackgroundTransparency = 0.35
@@ -1368,7 +1552,7 @@ local function buildSpeedo()
 	value.BackgroundTransparency = 1
 	value.Position = UDim2.new(0, 0, 0, 0)
 	value.Size = UDim2.new(1, 0, 1, 0)
-	value.Font = Enum.Font.GothamBold
+	useMono(value)
 	value.TextXAlignment = Enum.TextXAlignment.Center
 	value.TextSize = 28
 	value.TextColor3 = Color3.fromRGB(255, 255, 255)
@@ -1414,7 +1598,7 @@ local function updateLauncherScreen(dt)
 	if not launcherScreen then return end
 	local tool = stickyTool
 	local held = enabled and tool ~= nil and tool.Parent ~= nil and tool.Parent == player.Character
-	local on = held and inFirstPerson()
+	local on = held and (inFirstPerson() or CONFIG.colors.uiOpen)
 	if launcherScreen.gui.Enabled ~= on then launcherScreen.gui.Enabled = on end
 	if not on then return end
 
@@ -1603,15 +1787,26 @@ local function stepSource(dt)
 	local realSpeed = actual.Magnitude
 	if realSpeed > stats.peak then stats.peak = realSpeed end
 
+	-- A blast shields the launch for a beat and lifts the speed cap; the lift
+	-- then bleeds back down so the arc settles smoothly instead of snapping.
+	if (smState.blastHold or 0) > 0 then
+		smState.blastHold = math.max(0, smState.blastHold - dt)
+	end
+	local ceiling = SOURCE.ceiling
+	if (smState.softCeil or 0) > ceiling then ceiling = smState.softCeil end
+
 	-- On the ground the real velocity is the truth (we hit a wall, a slope, a
 	-- moving part). In the air we deliberately keep our own value: the humanoid
 	-- air-brakes a little every step, and adopting that "real" velocity used to
-	-- wipe out everything air-strafing had built up.
-	if grounded and actual.Magnitude < smState.hv.Magnitude - SOURCE.resync then
+	-- wipe out everything air-strafing had built up. During the blast grace we
+	-- keep our own value even on the ground, or a bomb at your feet would be
+	-- dragged straight back to a standstill.
+	if grounded and smState.blastHold <= 0
+		and actual.Magnitude < smState.hv.Magnitude - SOURCE.resync then
 		smState.hv = actual
 	end
-	if smState.hv.Magnitude > SOURCE.ceiling then
-		smState.hv = smState.hv.Unit * SOURCE.ceiling
+	if smState.hv.Magnitude > ceiling then
+		smState.hv = smState.hv.Unit * ceiling
 	end
 
 	local wish = smWishDir()
@@ -1624,7 +1819,11 @@ local function stepSource(dt)
 	-- Jump FIRST (Quake order). Jumping clears "grounded" before friction runs,
 	-- so the frame you touch down is the frame you leave again and a bunny-hop
 	-- keeps 100% of the speed it landed with.
-	if grounded and SOURCE.autoBhop and jumpHeld then
+	if smState.blastHold > 0 then
+		-- Blast grace: leave the launch untouched. Skipping ground friction and
+		-- the "adopt the real velocity" branch is what lets a bomb at your feet
+		-- throw you instead of being braked away the frame it fires.
+	elseif grounded and SOURCE.autoBhop and jumpHeld then
 		local vy = math.max(SOURCE.jumpPower, hum.JumpPower)
 		hrp.AssemblyLinearVelocity = Vector3.new(hv.X, vy, hv.Z)
 		grounded = false
@@ -1683,8 +1882,15 @@ local function stepSource(dt)
 		end
 	end
 
-	if hv.Magnitude > SOURCE.ceiling then
-		hv = hv.Unit * SOURCE.ceiling
+	if hv.Magnitude > ceiling then
+		hv = hv.Unit * ceiling
+	end
+
+	-- Bleed the post-blast cap lift back down to the real ceiling so the extra
+	-- speed fades out over about half a second instead of stopping dead.
+	if (smState.softCeil or 0) > SOURCE.ceiling then
+		smState.softCeil = math.max(SOURCE.ceiling,
+			smState.softCeil - (CONFIG.blast.ceilingDecay or 220) * dt)
 	end
 
 	smState.hv = hv
@@ -1702,18 +1908,18 @@ local chuteYaw = 0   -- the heading the canopy is currently trimmed to
 local chuteRepair = 0 -- last time we had to rebuild a swept-away rig
 local chute = { model = nil, root = nil, rig = nil, torso = nil, hrp = nil, rootWeld = nil, align = nil, socket = nil, parts = {}, wear = {}, d = 1, lastE = nil, roll = nil, lean = 0, lastC0 = nil }
 
-local CHUTE = {
-	canopy = Color3.fromRGB(204, 40, 44),   -- scarlet gores
-	panel  = Color3.fromRGB(245, 242, 236), -- off-white gores, crown, vent ring
-	rim    = Color3.fromRGB(34, 40, 60),    -- deep navy hem band and vent cap
-	rib    = Color3.fromRGB(226, 230, 236), -- pale seam tape laid over the gores
-	cord   = Color3.fromRGB(238, 238, 238), -- shroud lines
-	pack   = Color3.fromRGB(54, 56, 62),    -- harness pack on the back
-	pack2  = Color3.fromRGB(38, 40, 46),    -- pack lid / darker panels
-	strap  = Color3.fromRGB(28, 29, 34),    -- webbing straps
-	rip    = Color3.fromRGB(232, 140, 40),  -- ripcord
-	glow   = Color3.fromRGB(255, 226, 130), -- lantern while deployed
-}
+-- The canopy palette lives in CONFIG.colors.parachute, so the colour picker can
+-- retune it and a rebuilt rig simply reads the new values. This table forwards
+-- every lookup there (with a couple of legacy aliases), which keeps the build
+-- code below unchanged.
+local CHUTE = setmetatable({}, {
+	__index = function(_, k)
+		local P = CONFIG.colors.parachute
+		if k == "pack2" then return P.pack end
+		if k == "rip" then return P.rip or P.glow end
+		return P[k]
+	end,
+})
 
 -- Chute geometry, in the root's local frame - an UPRIGHT frame built at the
 -- torso's centre, with no pitch or roll of its own. The rig is CARRIED by the
@@ -1838,7 +2044,14 @@ local function buildParachute(base, gearBase)
 		else
 			rel = root.CFrame:Inverse() * part.CFrame
 		end
-		chute.parts[#chute.parts + 1] = { part = part, t = t, always = always, size = part.Size, rel = rel }
+		-- Remember which palette slot this part was painted from, so the colour
+		-- picker can repaint a live rig in place instead of rebuilding it.
+		local role
+		local P = CONFIG.colors.parachute
+		for k, v in pairs(P) do
+			if v == part.Color then role = k break end
+		end
+		chute.parts[#chute.parts + 1] = { part = part, t = t, always = always, size = part.Size, rel = rel, role = role, color = part.Color }
 		return part
 	end
 
@@ -1846,160 +2059,228 @@ local function buildParachute(base, gearBase)
 	-- Pivot the whole canopy backwards about the harness point.
 	local canopy = base * CFrame.new(CHUTE_HARNESS) * CFrame.Angles(CHUTE_TILT, 0, 0) * CFrame.new(-CHUTE_HARNESS)
 
-	-- The canopy is a HOLLOW SHELL, not a ball: thin cloth panels laid along a
-	-- domed profile, OPEN UNDERNEATH, so from below you are looking up into it.
-	--
-	-- The pattern is the classic round canopy: TWELVE WEDGE GORES, with the
-	-- colours alternating scarlet and off-white all the way round, so the canopy
-	-- reads as a real parachute from every angle instead of one smooth blob.
-	-- Each gore bellies out between its two seams (FLUTE) and the hem lifts
-	-- between the rigging points (SCALLOP), so the silhouette is a soft scalloped
-	-- curve and the seam tape sits down in the creases where it belongs.
-	--
-	-- Colour is carried per GORE, not per panel: every panel inside a gore is the
-	-- same colour, so the only lines that show are the ones that mean something -
-	-- the twelve gores, the navy hem band and the navy vent. That is what stops a
-	-- many-panel canopy reading as "planks bolted together"; a row seam running
-	-- through one colour is an invisible seam.
-	--
-	-- Every piece of it - cloth, vent cap, gore seams, hems, shroud lines - is
-	-- placed by the one profile below. That matters: the old canopy asked twice
-	-- and the two answers disagreed, leaving the cap and the whole cord ring
-	-- floating 0.6 studs off the back of the cloth. That was the "dislocated
-	-- dome".
-	--
-	-- The cloth is SmoothPlastic rather than Fabric, because Fabric carries a
-	-- woven grain that at distance looks like the surface is dirty or speckled.
-	-- SEGS is high (48, so each facet turns only seven and a half degrees) so the
-	-- silhouette and the shading stay close to a curve instead of reading as a
-	-- polygon.
-	local R = CHUTE_EDGE
-	local SEGS = 48                                 -- cloth panels round the rim
-	local GORES = 12                                -- gores, and so shroud lines
-	local SCALLOP = 0.30                            -- how far the hem lifts between lines
-	local FLUTE = 0.09                              -- how far a gore bellies between seams
-	local FLARE = 0.20                              -- how far the skirt bells out
-	-- Three rows: a navy hem band, then two rows carrying the scarlet/off-white
-	-- gores all the way up to the vent. Colour is chosen per GORE, so the stripes
-	-- run unbroken from hem to apex and the row seam across them is invisible.
-	local bands = { { 1.00, 0.88 }, { 0.88, 0.50 }, { 0.50, 0.12 } }
-	local function domeY(f) return CHUTE_RIM + CHUTE_DOME * (1 - f * f) end
-	-- f runs 1 at the hem and 0 at the vent. The radius is round through the
-	-- middle and bells out over the last stretch, the way a skirt flares.
-	local function domeR(f)
-		local bell = math.max(0, (f - 0.84) / 0.16)
-		return R * f + FLARE * bell * bell
-	end
-	-- How far across its own gore an azimuth sits, 0..1, with 0 on a seam line.
-	local function goreFrac(a)
-		local g = a / (math.pi * 2 / GORES)
-		return g - math.floor(g)
-	end
-	-- A point on the cloth, in the canopy's own frame. The gore bellies out at
-	-- its centre and tucks back to the bare dome radius on the seams; lifting
-	-- hangs the hem low at the rigging points and lifts it between them.
-	local function cloth(f, a, lifting)
-		local gf = goreFrac(a)
-		local dy = lifting and (SCALLOP * math.sin(math.pi * gf)) or 0
-		local r = domeR(f) * (1 + FLUTE * math.sin(math.pi * gf))
-		return Vector3.new(math.cos(a) * r, domeY(f) + dy, math.sin(a) * r + BACK)
-	end
+	-- Which canopy the user picked on the launcher screen. The palette is
+	-- shared; only the shape and the striping change. "classic" alternates the
+	-- gores, "stripe" is white with red stripes, "army" is one matte colour and
+	-- "wing" is the rectangular ram-air below.
+	local design = (CONFIG.parachute and CONFIG.parachute.design) or "classic"
 
-	-- The cloth. Each panel is a hair wider than the arc it covers so neighbours
-	-- overlap instead of leaving slits, and neighbouring panels are nudged a few
-	-- hundredths of a stud either side of the surface so that overlap cannot
-	-- z-fight.
-	for bi, band in ipairs(bands) do
-		local f1, f2 = band[1], band[2]
-		local chord = 2 * domeR(f1) * (1 + FLUTE) * math.sin(math.pi / SEGS) * 1.06
-		for i = 0, SEGS - 1 do
-			-- Panel centres are offset half a panel so the panel EDGES land on the
-			-- gore lines - which is where a real canopy's seams are sewn and where
-			-- the shroud lines pull, so the cloth's creases, the seam tape and the
-			-- cords all end up in the same place instead of half a panel apart.
-			local a = (i + 0.5) * (math.pi * 2 / SEGS)
-			local gore = math.floor(i / (SEGS / GORES))
-			local colour = (bi == 1 and CHUTE.rim)
-				or ((gore % 2 == 0) and CHUTE.canopy or CHUTE.panel)
-			local pa = cloth(f1, a, bi == 1)
-			local pb = cloth(f2, a, false)
-			local slope = pa - pb
-			local tangent = Vector3.new(-math.sin(a), 0, math.cos(a))
-			local slant = slope.Unit
-			local face = slant:Cross(tangent).Unit
-			local nudge = ((i % 2 == 0) and 0.03) or -0.03
-			local cf = CFrame.fromMatrix((pa + pb) * 0.5 + face * nudge, tangent, face, slant)
-			local box = makeBox(Vector3.new(chord, 0.1, slope.Magnitude), canopy * cf, colour, 0.06, Enum.Material.SmoothPlastic)
-			local it = add(box, 0.06)
-			it.color = colour
-			local slope = pa - pb
-			local tangent = Vector3.new(-math.sin(a), 0, math.cos(a))
-			local slant = slope.Unit
-			local face = slant:Cross(tangent).Unit
-			-- local X across the panel, Y its outward face, Z down the slope
-			local nudge = ((i % 2 == 0) and 0.03) or -0.03
-			local cf = CFrame.fromMatrix((pa + pb) * 0.5 + face * nudge, tangent, face, slant)
-		local part = makeBox(Vector3.new(chord, 0.1, slope.Magnitude), canopy * cf, colour, 0.06, Enum.Material.SmoothPlastic)
-		local item = add(part, 0.06)
-		item.color = colour
-			item.color = colour
+	local function buildWingCanopy()
+		-- A ram-air wing: a row of inflated cells along a lightly anhedral span,
+		-- closed by a rounded leading edge, with a shroud line off each cell
+		-- corner. Where the round canopy is revolved, this is extruded - the same
+		-- palette, an entirely different silhouette.
+		local SPAN = 9.4
+		local NC = 8
+		local CELLW = SPAN / NC
+		local CHORD = 3.4
+		local THICK = 1.15
+		local TOPY = CHUTE_RIM + 2.3
+		local ANHEDRAL = 1.1
+		local clothMat = (design == "army") and Enum.Material.Fabric or Enum.Material.SmoothPlastic
+		local function spanY(x)
+			local t = x / (SPAN * 0.5)
+			return TOPY - ANHEDRAL * t * t
+		end
+		local function cellColour(i)
+			if design == "army" then return CHUTE.canopy end
+			if i == 0 or i == NC - 1 then return CHUTE.panel end
+			if design == "stripe" and (i % 2 == 1) then return CHUTE.panel end
+			return CHUTE.canopy
+		end
+		local centers = {}
+		for i = 0, NC - 1 do
+			local x = -SPAN * 0.5 + (i + 0.5) * CELLW
+			local y = spanY(x)
+			centers[i + 1] = Vector3.new(x, y, BACK)
+			add(makeBox(Vector3.new(CELLW * 0.98, THICK, CHORD),
+				canopy * CFrame.new(x, y, BACK), cellColour(i), 0.03, clothMat), 0.03)
+			local nose = makeBox(Vector3.new(CELLW * 0.99, THICK, THICK),
+				canopy * CFrame.new(x, y, BACK - CHORD * 0.5), cellColour(i), 0.03, clothMat)
+			nose.Shape = Enum.PartType.Cylinder
+			add(nose, 0.03)
+		end
+		-- seam ribs stood proud between the cells
+		for i = 0, NC - 2 do
+			local xs = -SPAN * 0.5 + (i + 1) * CELLW
+			add(makeBox(Vector3.new(0.09, THICK + 0.14, CHORD * 0.94),
+				canopy * CFrame.new(xs, spanY(xs), BACK), CHUTE.rim, 0.1, clothMat), 0.1)
+		end
+		-- rigging: a line off the leading and trailing bottom corner of each cell
+		local gather = canopy * Vector3.new(0, CHUTE_RIM - 2.1, BACK)
+		for i = 1, NC do
+			local c = centers[i]
+			add(makeBeam(canopy * (c + Vector3.new(0, -THICK * 0.5, -CHORD * 0.5)), gather, 0.055, CHUTE.cord, 0.18), 0.18)
+			add(makeBeam(canopy * (c + Vector3.new(0, -THICK * 0.5, CHORD * 0.5)), gather, 0.055, CHUTE.cord, 0.18), 0.18)
+		end
+		local harness = base * CFrame.new(CHUTE_HARNESS)
+		for l = 0, 3 do
+			local a = l * (math.pi / 2)
+			add(makeBeam(gather, harness.p + Vector3.new(math.cos(a) * 0.3, 0, math.sin(a) * 0.3),
+				0.08, CHUTE.cord, 0.2), 0.2)
 		end
 	end
 
-	-- the vent: a navy cap over the hole at the top, so the apex reads as a vent
-	-- rather than a point, with the gore stripes running right up to it. Sized
-	-- past the crest of the top row, because a fluted gore stands proud of the
-	-- bare dome radius and a cap cut to that radius would leave a ring of daylight.
-	local capF = bands[#bands][2]
-	local capR = domeR(capF) * 1.3
-	local cap = makeBox(Vector3.new(0.12, capR * 2, capR * 2),
-		canopy * CFrame.new(0, domeY(capF) + 0.04, BACK) * CFrame.Angles(0, 0, math.rad(90)),
-		CHUTE.rim, 0.06, Enum.Material.SmoothPlastic)
-	cap.Shape = Enum.PartType.Cylinder
-	add(cap, 0.06)
-
-	-- Rigging, done the way a real chute is rigged: pale seam tape down every
-	-- gore line, a shroud line off every seam, the lines gathering at one point
-	-- under the canopy, and four risers carrying that point down your back to the
-	-- harness. The tape rides a little proud of the cloth so it reads as a seam
-	-- instead of vanishing into the panels, and its chain uses the same f stops
-	-- as the cloth rows, so every segment of it lies on the cloth.
-	local stops = { bands[1][1] }
-	for _, band in ipairs(bands) do stops[#stops + 1] = band[2] end
-	-- Looking straight down a seam line, the cloth you actually SEE is the crest
-	-- of the two panels meeting there, not the bare dome radius underneath them,
-	-- so the tape hangs on that radius - otherwise the fluted gores swallow it.
-	local perGore = SEGS / GORES
-	local SEAM_CREST = 1 + FLUTE * math.sin(math.pi / (2 * perGore))
-	local function seamPoint(f, a)
-		local r = domeR(f) * SEAM_CREST
-		return Vector3.new(math.cos(a) * r, domeY(f), math.sin(a) * r + BACK)
-	end
-	local harness = base * CFrame.new(CHUTE_HARNESS)
-	local gather = canopy * Vector3.new(0, CHUTE_RIM - 2.1, BACK)
-	for g = 0, GORES - 1 do
-		-- The seam runs down the gore line, and its hem END is the scallop's LOW
-		-- point - the place a real canopy's lines are sewn, because it is the
-		-- point the suspension pulls down.
-		local a = g * (math.pi * 2 / GORES)
-		local proud = Vector3.new(math.cos(a) * 0.05, 0, math.sin(a) * 0.05)
-		local hem = seamPoint(bands[1][1], a)
-
-		local prev = nil
-		for _, f in ipairs(stops) do
-			local p = seamPoint(f, a) + proud
-			if prev then add(makeBeam(canopy * prev, canopy * p, 0.09, CHUTE.rib, 0.04), 0.04) end
-			prev = p
+	if design ~= "wing" then
+		-- The canopy is a HOLLOW SHELL, not a ball: thin cloth panels laid along a
+		-- domed profile, OPEN UNDERNEATH, so from below you are looking up into it.
+		--
+		-- The pattern is the classic round canopy: TWELVE WEDGE GORES, with the
+		-- colours alternating scarlet and off-white all the way round, so the canopy
+		-- reads as a real parachute from every angle instead of one smooth blob.
+		-- Each gore bellies out between its two seams (FLUTE) and the hem lifts
+		-- between the rigging points (SCALLOP), so the silhouette is a soft scalloped
+		-- curve and the seam tape sits down in the creases where it belongs.
+		--
+		-- Colour is carried per GORE, not per panel: every panel inside a gore is the
+		-- same colour, so the only lines that show are the ones that mean something -
+		-- the twelve gores, the navy hem band and the navy vent. That is what stops a
+		-- many-panel canopy reading as "planks bolted together"; a row seam running
+		-- through one colour is an invisible seam.
+		--
+		-- Every piece of it - cloth, vent cap, gore seams, hems, shroud lines - is
+		-- placed by the one profile below. That matters: the old canopy asked twice
+		-- and the two answers disagreed, leaving the cap and the whole cord ring
+		-- floating 0.6 studs off the back of the cloth. That was the "dislocated
+		-- dome".
+		--
+		-- The cloth is SmoothPlastic rather than Fabric, because Fabric carries a
+		-- woven grain that at distance looks like the surface is dirty or speckled.
+		-- SEGS is high (48, so each facet turns only seven and a half degrees) so the
+		-- silhouette and the shading stay close to a curve instead of reading as a
+		-- polygon.
+		local R = CHUTE_EDGE
+		local SEGS = 48                                 -- cloth panels round the rim
+		local GORES = 12                                -- gores, and so shroud lines
+		local SCALLOP = 0.30                            -- how far the hem lifts between lines
+		local FLUTE = 0.09                              -- how far a gore bellies between seams
+		local FLARE = 0.20                              -- how far the skirt bells out
+		-- Three rows: a navy hem band, then two rows carrying the scarlet/off-white
+		-- gores all the way up to the vent. Colour is chosen per GORE, so the stripes
+		-- run unbroken from hem to apex and the row seam across them is invisible.
+		local bands = { { 1.00, 0.88 }, { 0.88, 0.50 }, { 0.50, 0.12 } }
+		-- Army flies a deeper, matte dome; the others keep the classic profile.
+		local DOME = CHUTE_DOME * ((design == "army") and 1.18 or 1.0)
+		local clothMat = (design == "army") and Enum.Material.Fabric or Enum.Material.SmoothPlastic
+		-- Colour by design: army is one flat colour, "stripe" is white with a red
+		-- stripe every third gore, and "classic" alternates the gores all the way
+		-- round the canopy.
+		local function goreColour(bi, gore)
+			if design == "army" then return CHUTE.canopy end
+			if bi == 1 then return CHUTE.rim end
+			if design == "stripe" then
+				return (gore % 3 == 2) and CHUTE.panel or CHUTE.canopy
+			end
+			return (gore % 2 == 0) and CHUTE.canopy or CHUTE.panel
+		end
+		local function domeY(f) return CHUTE_RIM + DOME * (1 - f * f) end
+		-- f runs 1 at the hem and 0 at the vent. The radius is round through the
+		-- middle and bells out over the last stretch, the way a skirt flares.
+		local function domeR(f)
+			local bell = math.max(0, (f - 0.84) / 0.16)
+			return R * f + FLARE * bell * bell
+		end
+		-- How far across its own gore an azimuth sits, 0..1, with 0 on a seam line.
+		local function goreFrac(a)
+			local g = a / (math.pi * 2 / GORES)
+			return g - math.floor(g)
+		end
+		-- A point on the cloth, in the canopy's own frame. The gore bellies out at
+		-- its centre and tucks back to the bare dome radius on the seams; lifting
+		-- hangs the hem low at the rigging points and lifts it between them.
+		local function cloth(f, a, lifting)
+			local gf = goreFrac(a)
+			local dy = lifting and (SCALLOP * math.sin(math.pi * gf)) or 0
+			local r = domeR(f) * (1 + FLUTE * math.sin(math.pi * gf))
+			return Vector3.new(math.cos(a) * r, domeY(f) + dy, math.sin(a) * r + BACK)
 		end
 
-		add(makeBeam(canopy * hem, gather, 0.065, CHUTE.cord, 0.15), 0.15)
-	end
+		-- The cloth. Each panel is a hair wider than the arc it covers so neighbours
+		-- overlap instead of leaving slits, and neighbouring panels are nudged a few
+		-- hundredths of a stud either side of the surface so that overlap cannot
+		-- z-fight.
+		for bi, band in ipairs(bands) do
+			local f1, f2 = band[1], band[2]
+			local chord = 2 * domeR(f1) * (1 + FLUTE) * math.sin(math.pi / SEGS) * 1.06
+			for i = 0, SEGS - 1 do
+				-- Panel centres are offset half a panel so the panel EDGES land on the
+				-- gore lines - which is where a real canopy's seams are sewn and where
+				-- the shroud lines pull, so the cloth's creases, the seam tape and the
+				-- cords all end up in the same place instead of half a panel apart.
+				local a = (i + 0.5) * (math.pi * 2 / SEGS)
+				local gore = math.floor(i / (SEGS / GORES))
+				local colour = goreColour(bi, gore)
+				local pa = cloth(f1, a, bi == 1)
+				local pb = cloth(f2, a, false)
+				local slope = pa - pb
+				local tangent = Vector3.new(-math.sin(a), 0, math.cos(a))
+				local slant = slope.Unit
+				local face = slant:Cross(tangent).Unit
+				local nudge = ((i % 2 == 0) and 0.03) or -0.03
+				local cf = CFrame.fromMatrix((pa + pb) * 0.5 + face * nudge, tangent, face, slant)
+				local box = makeBox(Vector3.new(chord, 0.1, slope.Magnitude), canopy * cf, colour, 0.06, clothMat)
+				add(box, 0.06)
+			end
+		end
 
-	-- the risers: gathering point down to the pack, spread a little at the harness
-	for l = 0, 3 do
-		local a = l * (math.pi / 2)
-		add(makeBeam(gather, harness.p + Vector3.new(math.cos(a) * 0.3, 0, math.sin(a) * 0.3),
-			0.08, CHUTE.cord, 0.2), 0.2)
+		-- the vent: a navy cap over the hole at the top, so the apex reads as a vent
+		-- rather than a point, with the gore stripes running right up to it. Sized
+		-- past the crest of the top row, because a fluted gore stands proud of the
+		-- bare dome radius and a cap cut to that radius would leave a ring of daylight.
+		local capF = bands[#bands][2]
+		local capR = domeR(capF) * 1.3
+		local capColour = (design == "army") and CHUTE.canopy or CHUTE.rim
+		local cap = makeBox(Vector3.new(0.12, capR * 2, capR * 2),
+			canopy * CFrame.new(0, domeY(capF) + 0.04, BACK) * CFrame.Angles(0, 0, math.rad(90)),
+			capColour, 0.06, clothMat)
+		cap.Shape = Enum.PartType.Cylinder
+		add(cap, 0.06)
+
+		-- Rigging, done the way a real chute is rigged: pale seam tape down every
+		-- gore line, a shroud line off every seam, the lines gathering at one point
+		-- under the canopy, and four risers carrying that point down your back to the
+		-- harness. The tape rides a little proud of the cloth so it reads as a seam
+		-- instead of vanishing into the panels, and its chain uses the same f stops
+		-- as the cloth rows, so every segment of it lies on the cloth.
+		local stops = { bands[1][1] }
+		for _, band in ipairs(bands) do stops[#stops + 1] = band[2] end
+		-- Looking straight down a seam line, the cloth you actually SEE is the crest
+		-- of the two panels meeting there, not the bare dome radius underneath them,
+		-- so the tape hangs on that radius - otherwise the fluted gores swallow it.
+		local perGore = SEGS / GORES
+		local SEAM_CREST = 1 + FLUTE * math.sin(math.pi / (2 * perGore))
+		local function seamPoint(f, a)
+			local r = domeR(f) * SEAM_CREST
+			return Vector3.new(math.cos(a) * r, domeY(f), math.sin(a) * r + BACK)
+		end
+		local harness = base * CFrame.new(CHUTE_HARNESS)
+		local gather = canopy * Vector3.new(0, CHUTE_RIM - 2.1, BACK)
+		for g = 0, GORES - 1 do
+			-- The seam runs down the gore line, and its hem END is the scallop's LOW
+			-- point - the place a real canopy's lines are sewn, because it is the
+			-- point the suspension pulls down.
+			local a = g * (math.pi * 2 / GORES)
+			local proud = Vector3.new(math.cos(a) * 0.05, 0, math.sin(a) * 0.05)
+			local hem = seamPoint(bands[1][1], a)
+
+			local prev = nil
+			for _, f in ipairs(stops) do
+				local p = seamPoint(f, a) + proud
+				if prev then add(makeBeam(canopy * prev, canopy * p, 0.09, CHUTE.rib, 0.04), 0.04) end
+				prev = p
+			end
+
+			add(makeBeam(canopy * hem, gather, 0.065, CHUTE.cord, 0.15), 0.15)
+		end
+
+		-- the risers: gathering point down to the pack, spread a little at the harness
+		for l = 0, 3 do
+			local a = l * (math.pi / 2)
+			add(makeBeam(gather, harness.p + Vector3.new(math.cos(a) * 0.3, 0, math.sin(a) * 0.3),
+				0.08, CHUTE.cord, 0.2), 0.2)
+		end
+	else
+		buildWingCanopy()
 	end
 
 	-- a lantern hanging under the canopy, lit only while deployed. The orb
@@ -2250,11 +2531,32 @@ local function spawnChutePuff()
 	end
 end
 
+-- The colour a part should be right now: whatever the picker has set for its
+-- role, falling back to the colour it was built with.
+local function chuteColorFor(item)
+	if item.role then
+		local c = CONFIG.colors.parachute[item.role]
+		if c then return c end
+	end
+	return item.color or CONFIG.colors.parachute.canopy
+end
+
+-- Repaint the live rig after the picker changes a colour. No rebuild: each part
+-- remembers the palette slot it came from.
+local function recolorChute()
+	for _, item in ipairs(chute.parts) do
+		if item.part.Parent then
+			item.part.Color = chuteColorFor(item)
+		end
+	end
+	if chute.light then chute.light.Color = CONFIG.colors.parachute.glow end
+end
+
 -- Snap every part to its visible/hidden state with no animation.
 local function chuteVisible(vis)
 	for _, item in ipairs(chute.parts) do
 		if item.part.Parent then
-			item.part.Color = item.color or CONFIG.colors.parachute.canopy
+			item.part.Color = chuteColorFor(item)
 			item.part.Transparency = (item.always or vis) and item.t or 1
 		end
 	end
@@ -2267,13 +2569,13 @@ local function chuteFade(vis, time)
 		if item.part.Parent and not item.always then
 			local target = vis and item.t or 1
 			if math.abs(item.part.Transparency - target) > 0.001 then
-			item.part.Color = item.color or CONFIG.colors.parachute.canopy
-			local tw = TweenService:Create(item.part,
-				TweenInfo.new(time, Enum.EasingStyle.Quad, Enum.EasingDirection.Out),
-				{ Transparency = target })
-			table.insert(chuteTweens, tw)
-			tw:Play()
-		end
+				item.part.Color = chuteColorFor(item)
+				local tw = TweenService:Create(item.part,
+					TweenInfo.new(time, Enum.EasingStyle.Quad, Enum.EasingDirection.Out),
+					{ Transparency = target })
+				table.insert(chuteTweens, tw)
+				tw:Play()
+			end
 		end
 	end
 end
@@ -2618,6 +2920,329 @@ local function stepParachute(dt)
 	end
 end
 
+-- colour picker (RightShift) -------------------------------------------------
+--
+-- The picker lives ON the launcher's own screen - the same little panel that
+-- shows your speed and charge in first person - so changes are made right where
+-- you are already looking. RightShift opens it and frees the mouse so the
+-- controls can be clicked; pressing it again closes it and hands the mouse back.
+--
+-- Navigation on a surface this small is built on two ideas. The top row picks
+-- the canopy SHAPE (round / stripe / army / wing) and the grid below it is the
+-- palette: click a slot and its colour steps to the next in
+-- CONFIG.colors.palette, repainting the live launcher and canopy in place. The
+-- patch under the cursor lights up as you move, so a click is never a guess.
+--
+-- Clicks are found by hand (pickRegion): the engine's own SurfaceGui ray is
+-- stopped by pieces of our own character hanging right in front of the camera in
+-- first person, so it never reaches the panel on its own.
+
+local colorMenu = nil
+local savedMouseBehavior = nil
+local clickRegions = {}   -- every clickable patch: { u, v, w, h, onPick, hi }
+local hoverRegion = nil   -- the patch under the cursor, for the hover outline
+local designButtons = {}  -- slug -> { btn, stroke }, for the selected highlight
+
+local function paletteStep(current)
+	local pal = CONFIG.colors.palette
+	local idx = 0
+	for i, v in ipairs(pal) do
+		if v == current then idx = i break end
+	end
+	idx = idx % #pal + 1
+	return pal[idx], idx
+end
+
+local function repaint()
+	applyLauncherColors()
+	recolorChute()
+end
+
+-- Swap the canopy shape. The design only changes geometry, so the rig is rebuilt
+-- from scratch; if the chute was flying it is popped straight back open.
+local function setChuteDesign(slug)
+	if CONFIG.parachute.design == slug then return end
+	CONFIG.parachute.design = slug
+	saveSettings()
+	local ch = player.Character
+	if not ch then return end
+	local wasOpen = chuteOpen
+	attachParachute(ch)
+	if wasOpen then
+		chuteOpen = true
+		chute.d = 1
+		chute.lastE = nil
+		driveChute(1)
+		chuteVisible(true)
+		if chute.light and CONFIG.parachute.light then chute.light.Enabled = true end
+	else
+		chuteOpen = false
+		chuteVisible(false)
+	end
+end
+
+local function addRegion(u, v, w, h, onPick)
+	local r = { u = u, v = v, w = w, h = h, onPick = onPick }
+	clickRegions[#clickRegions + 1] = r
+	return r
+end
+
+-- Which patch of the screen is under a point? The launcher is welded solid and
+-- every part of it is unqueryable, so ray at just the screen panel and read where
+-- the hit lands in the panel's own space - that maps straight onto the 0..1
+-- canvas the controls are laid out on. The point is in SCREEN space (the same
+-- space the mouse reports), so ScreenPointToRay - not ViewportPointToRay - is
+-- the one that takes the top-bar inset into account.
+local function pickRegion(vx, vy)
+	if not (CONFIG.colors.uiOpen and launcherScreen and launcherScreen.part) then return nil end
+	local cam = workspace.CurrentCamera
+	if not cam then return nil end
+	local part = launcherScreen.part
+	local ray = cam:ScreenPointToRay(vx, vy)
+	local params = RaycastParams.new()
+	params.FilterType = Enum.RaycastFilterType.Include
+	params.FilterDescendantsInstances = { part }
+	local hit = workspace:Raycast(ray.Origin, ray.Direction * 30, params)
+	if not hit then return nil end
+	local lp = part.CFrame:PointToObjectSpace(hit.Position)
+	local s = part.Size
+	local u = (lp.X + s.X * 0.5) / s.X
+	local v = (s.Y * 0.5 - lp.Y) / s.Y
+	for _, r in ipairs(clickRegions) do
+		if u >= r.u and u <= r.u + r.w and v >= r.v and v <= r.v + r.h then
+			return r
+		end
+	end
+	return nil
+end
+
+-- Apply a click at a screen point. Returns true when it landed on a control.
+local function applyClickAt(vx, vy)
+	local r = pickRegion(vx, vy)
+	if not r then return false end
+	r.onPick()
+	return true
+end
+
+-- Light the patch under the cursor, so a click is never a guess.
+local function updateHover(vx, vy)
+	local r = pickRegion(vx, vy)
+	if r ~= hoverRegion then
+		if hoverRegion and hoverRegion.hi then hoverRegion.hi(false) end
+		hoverRegion = r
+		if hoverRegion and hoverRegion.hi then hoverRegion.hi(true) end
+	end
+end
+
+local function clearHover()
+	if hoverRegion and hoverRegion.hi then hoverRegion.hi(false) end
+	hoverRegion = nil
+end
+
+-- One palette slot. A label, not a button: clicks are handled by pickRegion.
+local function colorSwatch(parent, slot, pos, size)
+	local btn = Instance.new("TextLabel")
+	btn.Name = slot.group .. "_" .. slot.key
+	btn.Position = pos
+	btn.Size = size
+	btn.BackgroundColor3 = CONFIG.colors[slot.group][slot.key]
+	btn.BorderSizePixel = 0
+	btn.Text = slot.label
+	useMono(btn)
+	btn.TextScaled = true
+	btn.TextColor3 = Color3.fromRGB(255, 255, 255)
+	btn.TextStrokeTransparency = 0.35
+	btn.ZIndex = 9
+	btn.Parent = parent
+	local c = Instance.new("UICorner")
+	c.CornerRadius = UDim.new(0, 3)
+	c.Parent = btn
+	local s = Instance.new("UIStroke")
+	s.Color = Color3.fromRGB(255, 255, 255)
+	s.Transparency = 0.55
+	s.Parent = btn
+	local cap = Instance.new("UITextSizeConstraint")
+	cap.MaxTextSize = 20
+	cap.MinTextSize = 4
+	cap.Parent = btn
+
+	local r = addRegion(pos.X.Scale, pos.Y.Scale, size.X.Scale, size.Y.Scale, function()
+		local nextColor = paletteStep(CONFIG.colors[slot.group][slot.key])
+		CONFIG.colors[slot.group][slot.key] = nextColor
+		btn.BackgroundColor3 = nextColor
+		repaint()
+		saveSettings()
+	end)
+	r.hi = function(on)
+		s.Transparency = on and 0 or 0.55
+		s.Thickness = on and 2 or 1
+	end
+	return btn
+end
+
+local DESIGN_LABEL = { classic = "ROUND", stripe = "STRIPE", army = "ARMY", wing = "WING" }
+
+local function highlightDesign()
+	local cur = CONFIG.parachute.design
+	for slug, entry in pairs(designButtons) do
+		local on = (slug == cur)
+		entry.stroke.Color = on and Color3.fromRGB(255, 160, 60) or Color3.fromRGB(90, 92, 100)
+		entry.stroke.Thickness = on and 2 or 1
+		entry.btn.BackgroundColor3 = on and Color3.fromRGB(58, 40, 18) or Color3.fromRGB(22, 24, 30)
+	end
+end
+
+-- One canopy-shape button. Also picked by hand, for the same reason as the
+-- palette slots.
+local function designButton(parent, slug, pos, size)
+	local btn = Instance.new("TextLabel")
+	btn.Name = "Design_" .. slug
+	btn.Position = pos
+	btn.Size = size
+	btn.BackgroundColor3 = Color3.fromRGB(22, 24, 30)
+	btn.BorderSizePixel = 0
+	btn.Text = DESIGN_LABEL[slug] or string.upper(slug)
+	useMono(btn)
+	btn.TextScaled = true
+	btn.TextColor3 = Color3.fromRGB(235, 235, 240)
+	btn.ZIndex = 9
+	btn.Parent = parent
+	local c = Instance.new("UICorner")
+	c.CornerRadius = UDim.new(0, 3)
+	c.Parent = btn
+	local s = Instance.new("UIStroke")
+	s.Color = Color3.fromRGB(90, 92, 100)
+	s.Transparency = 0.2
+	s.Parent = btn
+	local cap = Instance.new("UITextSizeConstraint")
+	cap.MaxTextSize = 18
+	cap.MinTextSize = 5
+	cap.Parent = btn
+
+	designButtons[slug] = { btn = btn, stroke = s }
+	local r = addRegion(pos.X.Scale, pos.Y.Scale, size.X.Scale, size.Y.Scale, function()
+		setChuteDesign(slug)
+		highlightDesign()
+		saveSettings()
+	end)
+	r.hi = function(on)
+		s.Transparency = on and 0 or 0.35
+		btn.TextColor3 = on and Color3.new(1, 1, 1) or Color3.fromRGB(235, 235, 240)
+	end
+	return btn
+end
+
+local function buildColorPanel()
+	if colorMenu and colorMenu.Parent then return end
+	clickRegions = {}
+	designButtons = {}
+	hoverRegion = nil
+	local gui = launcherScreen and launcherScreen.gui
+	if not gui or not gui.Parent then return end
+
+	colorMenu = Instance.new("Frame")
+	colorMenu.Name = "ColorMenu"
+	colorMenu.Size = UDim2.new(1, 0, 1, 0)
+	colorMenu.BackgroundColor3 = Color3.fromRGB(10, 12, 16)
+	colorMenu.BackgroundTransparency = 0.02
+	colorMenu.BorderSizePixel = 0
+	colorMenu.ZIndex = 8
+	colorMenu.Visible = false
+	colorMenu.Parent = gui
+	local corner = Instance.new("UICorner")
+	corner.CornerRadius = UDim.new(0, 6)
+	corner.Parent = colorMenu
+	local stroke = Instance.new("UIStroke")
+	stroke.Color = Color3.fromRGB(226, 118, 28)
+	stroke.Thickness = 1.5
+	stroke.Transparency = 0.3
+	stroke.Parent = colorMenu
+
+	local title = Instance.new("TextLabel")
+	title.Name = "Title"
+	title.BackgroundTransparency = 1
+	title.Size = UDim2.new(1, 0, 0.13, 0)
+	title.Position = UDim2.new(0, 0, 0, 0)
+	useMono(title)
+	title.TextScaled = true
+	title.TextXAlignment = Enum.TextXAlignment.Center
+	title.TextColor3 = Color3.fromRGB(255, 170, 70)
+	title.Text = "CUSTOMISE"
+	title.ZIndex = 9
+	title.Parent = colorMenu
+	local tcap = Instance.new("UITextSizeConstraint")
+	tcap.MaxTextSize = 24
+	tcap.MinTextSize = 6
+	tcap.Parent = title
+
+	local gap = 0.015
+
+	-- Shape row: one button per canopy design.
+	local designs = CONFIG.parachute.designs or { "classic" }
+	local dn = #designs
+	local dw = (1 - gap * (dn + 1)) / dn
+	for i, slug in ipairs(designs) do
+		local x = gap + (i - 1) * (dw + gap)
+		designButton(colorMenu, slug,
+			UDim2.new(x, 0, 0.14, 0),
+			UDim2.new(dw, 0, 0.17, 0))
+	end
+	highlightDesign()
+
+	-- Short labels so they survive being scaled onto a small screen.
+	local slots = {
+		{ label = "LA METAL",  group = "launcher",  key = "metal" },
+		{ label = "LA DARK",   group = "launcher",  key = "dark" },
+		{ label = "LA WOOD",   group = "launcher",  key = "wood" },
+		{ label = "LA ACCENT", group = "launcher",  key = "accent" },
+		{ label = "CANOPY",    group = "parachute", key = "canopy" },
+		{ label = "STRIPES",   group = "parachute", key = "panel" },
+		{ label = "HEM",       group = "parachute", key = "rim" },
+		{ label = "SEAM",      group = "parachute", key = "rib" },
+		{ label = "LINES",     group = "parachute", key = "cord" },
+		{ label = "PACK",      group = "parachute", key = "pack" },
+		{ label = "STRAPS",    group = "parachute", key = "strap" },
+		{ label = "RIPCORD",   group = "parachute", key = "rip" },
+	}
+
+	-- 3 columns x 4 rows filling everything below the shape row.
+	local cols, rows = 3, 4
+	local top = 0.33
+	local cw = (1 - gap * (cols + 1)) / cols
+	local rh = (1 - top - gap * (rows + 1)) / rows
+	for i, slot in ipairs(slots) do
+		local ci = (i - 1) % cols
+		local ri = math.floor((i - 1) / cols)
+		colorSwatch(colorMenu, slot,
+			UDim2.new(gap + ci * (cw + gap), 0, top + gap + ri * (rh + gap), 0),
+			UDim2.new(cw, 0, rh, 0))
+	end
+end
+
+local function toggleColorPanel()
+	buildColorPanel()
+	if not colorMenu then return end
+	CONFIG.colors.uiOpen = not CONFIG.colors.uiOpen
+	colorMenu.Visible = CONFIG.colors.uiOpen
+	if CONFIG.colors.uiOpen then
+		stickyCharging = false
+		-- Remember how the mouse was and free it so the swatches can be clicked.
+		local ok, behaviour = pcall(function() return UserInputService.MouseBehavior end)
+		savedMouseBehavior = ok and behaviour or nil
+		pcall(function() UserInputService.MouseBehavior = Enum.MouseBehavior.Default end)
+		pcall(function() UserInputService.MouseIconEnabled = true end)
+	else
+		clearHover()
+		local restore = savedMouseBehavior
+		savedMouseBehavior = nil
+		if restore == Enum.MouseBehavior.LockCenter or restore == Enum.MouseBehavior.LockCurrentPosition then
+			pcall(function() UserInputService.MouseBehavior = restore end)
+		else
+			pcall(function() UserInputService.MouseBehavior = Enum.MouseBehavior.Default end)
+		end
+	end
+end
+
 -- unload --------------------------------------------------------------------
 
 local function unload()
@@ -2626,7 +3251,15 @@ local function unload()
 	clearEffects()
 	detachParachute()
 	pcall(function() RunService:UnbindFromRenderStep("StickyLauncherAim") end)
+	pcall(function() RunService:UnbindFromRenderStep("StickyColorMouse") end)
 	releaseAimGrip()
+	if colorMenu then colorMenu:Destroy() colorMenu = nil end
+	if CONFIG.colors.uiOpen then
+		CONFIG.colors.uiOpen = false
+		if inFirstPerson() then
+			pcall(function() UserInputService.MouseBehavior = Enum.MouseBehavior.LockCenter end)
+		end
+	end
 	if chargeGui then chargeGui:Destroy() chargeGui = nil end
 	if speedGui then speedGui:Destroy() speedGui = nil end
 	if stickyTool and stickyTool.Parent then stickyTool:Destroy() end
@@ -2653,14 +3286,54 @@ attachParachute(player.Character)
 -- it is aimed with this frame's view rather than the previous frame's.
 RunService:BindToRenderStep("StickyLauncherAim", Enum.RenderPriority.Camera.Value + 1, stepLauncherAim)
 
+-- While the colour picker is open the cursor has to be free to click the
+-- swatches, but the camera controller re-locks the mouse every frame. Writing
+-- the release from a late render step - after the controller has had its turn -
+-- is what actually makes it stick.
+RunService:BindToRenderStep("StickyColorMouse", Enum.RenderPriority.Last.Value, function()
+	if CONFIG.colors.uiOpen then
+		if UserInputService.MouseBehavior ~= Enum.MouseBehavior.Default then
+			pcall(function() UserInputService.MouseBehavior = Enum.MouseBehavior.Default end)
+		end
+		if not UserInputService.MouseIconEnabled then
+			pcall(function() UserInputService.MouseIconEnabled = true end)
+		end
+		-- Light whatever control the cursor is over.
+		local m = player:GetMouse()
+		updateHover(m.X, m.Y)
+	elseif hoverRegion then
+		clearHover()
+	end
+end)
+
 local toolWatch = 0
 
 table.insert(globalConns, UserInputService.InputBegan:Connect(function(input, gameProcessed)
 	-- RMB detonates everything you have stuck. Handled before the gameProcessed
 	-- guard so it works even if the game uses RMB to aim.
 	if input.UserInputType == Enum.UserInputType.MouseButton2 and enabled and stickyToolEquipped() then
+		-- The colour picker owns the mouse while it is open; clicks there are UI.
+		if CONFIG.colors.uiOpen then return end
 		-- Only while aiming: first person or shiftlock. Third person ignores it.
 		if detonateArmed() then detonateStickies() end
+		return
+	end
+
+	-- Clicks land on the screen panel. The picker frees the cursor, and the
+	-- control under it is found with our own ray at the panel - the engine's
+	-- SurfaceGui ray is blocked by bits of our own character that sit right in
+	-- front of the camera, so it never fires in first person.
+	if CONFIG.colors.uiOpen and input.UserInputType == Enum.UserInputType.MouseButton1 then
+		local m = player:GetMouse()
+		applyClickAt(m.X, m.Y)
+		return
+	end
+
+	-- RightShift toggles the colour picker. Handled before the gameProcessed
+	-- guard because this place binds RightShift itself, so it always arrives
+	-- flagged as processed.
+	if input.KeyCode == Enum.KeyCode.RightShift then
+		toggleColorPanel()
 		return
 	end
 
@@ -2717,6 +3390,8 @@ table.insert(globalConns, player.CharacterAdded:Connect(function(character)
 	smState.hv = Vector3.new()
 	smState.buildFailed = false
 	smState.warn = nil
+	smState.blastHold = 0
+	smState.softCeil = 0
 	smTeardown()
 	smCleanStrays(character)
 	detachParachute()
@@ -2748,6 +3423,19 @@ genv.__StickyJumper = {
 		buildLauncher = buildLauncher,
 		launcher = function() return launcherRoot end,
 		screen = function() return launcherScreen end,
+		applyLauncherColors = applyLauncherColors,
+		recolorChute = recolorChute,
+		toggleColorPanel = toggleColorPanel,
+		pickRegion = pickRegion,
+		applyClickAt = applyClickAt,
+		clickRegionCount = function() return #clickRegions end,
+		setChuteDesign = setChuteDesign,
+		saveSettings = saveSettings,
+		loadSettings = loadSettings,
+		resetSettings = resetSettings,
+		settingsLoaded = function() return settingsLoaded end,
+		colorPanel = function() return colorMenu end,
+		colorMenu = function() return colorMenu end,
 		chargeBar = function() return chargeBack end,
 		inFirstPerson = inFirstPerson,
 		detonateArmed = detonateArmed,
