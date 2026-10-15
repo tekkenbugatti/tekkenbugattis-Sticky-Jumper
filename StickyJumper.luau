@@ -225,7 +225,7 @@ CONFIG.colors = {
 	},
 }
 
-local VERSION = "1.73"
+local VERSION = "1.74"
 
 local genv = (getgenv and getgenv()) or _G
 
@@ -2939,6 +2939,7 @@ end
 
 local colorMenu = nil
 local savedMouseBehavior = nil
+local savedMouseIcon = nil
 local clickRegions = {}   -- every clickable patch: { u, v, w, h, onPick, hi }
 local hoverRegion = nil   -- the patch under the cursor, for the hover outline
 local designButtons = {}  -- slug -> { btn, stroke }, for the selected highlight
@@ -3219,28 +3220,53 @@ local function buildColorPanel()
 	end
 end
 
+local function closeColorPanel(release)
+	CONFIG.colors.uiOpen = false
+	if colorMenu then colorMenu.Visible = false end
+	clearHover()
+	local restore = savedMouseBehavior
+	local restoreIcon = savedMouseIcon
+	savedMouseBehavior = nil
+	savedMouseIcon = nil
+	-- Hand the mouse back the way we found it - unless we are being closed
+	-- because you left first person, in which case the pinned behaviour we
+	-- captured while aiming is exactly the wrong thing to put back. This place
+	-- expects a free cursor in plain third person, so a mouse nailed to the
+	-- middle of the screen just reads as "my mouse is stuck".
+	if not release
+		and (restore == Enum.MouseBehavior.LockCenter or restore == Enum.MouseBehavior.LockCurrentPosition) then
+		pcall(function() UserInputService.MouseBehavior = restore end)
+	else
+		pcall(function() UserInputService.MouseBehavior = Enum.MouseBehavior.Default end)
+	end
+	if restoreIcon ~= nil then
+		pcall(function() UserInputService.MouseIconEnabled = restoreIcon end)
+	end
+end
+
 local function toggleColorPanel()
+	if CONFIG.colors.uiOpen then
+		closeColorPanel(false)
+		return
+	end
+
+	-- Only opens with the launcher in hand and you looking down its sights: that
+	-- is the one setup where the screen is turned towards you. Opening it
+	-- anywhere else would free the cursor with nothing in front of you to click.
+	if not (enabled and stickyToolEquipped() and inFirstPerson()) then return end
+
 	buildColorPanel()
 	if not colorMenu then return end
-	CONFIG.colors.uiOpen = not CONFIG.colors.uiOpen
-	colorMenu.Visible = CONFIG.colors.uiOpen
-	if CONFIG.colors.uiOpen then
-		stickyCharging = false
-		-- Remember how the mouse was and free it so the swatches can be clicked.
-		local ok, behaviour = pcall(function() return UserInputService.MouseBehavior end)
-		savedMouseBehavior = ok and behaviour or nil
-		pcall(function() UserInputService.MouseBehavior = Enum.MouseBehavior.Default end)
-		pcall(function() UserInputService.MouseIconEnabled = true end)
-	else
-		clearHover()
-		local restore = savedMouseBehavior
-		savedMouseBehavior = nil
-		if restore == Enum.MouseBehavior.LockCenter or restore == Enum.MouseBehavior.LockCurrentPosition then
-			pcall(function() UserInputService.MouseBehavior = restore end)
-		else
-			pcall(function() UserInputService.MouseBehavior = Enum.MouseBehavior.Default end)
-		end
-	end
+	CONFIG.colors.uiOpen = true
+	colorMenu.Visible = true
+	stickyCharging = false
+	-- Remember how the mouse was and free it so the swatches can be clicked.
+	local okB, behaviour = pcall(function() return UserInputService.MouseBehavior end)
+	savedMouseBehavior = okB and behaviour or nil
+	local okI, icon = pcall(function() return UserInputService.MouseIconEnabled end)
+	savedMouseIcon = okI and icon or nil
+	pcall(function() UserInputService.MouseBehavior = Enum.MouseBehavior.Default end)
+	pcall(function() UserInputService.MouseIconEnabled = true end)
 end
 
 -- unload --------------------------------------------------------------------
@@ -3254,12 +3280,7 @@ local function unload()
 	pcall(function() RunService:UnbindFromRenderStep("StickyColorMouse") end)
 	releaseAimGrip()
 	if colorMenu then colorMenu:Destroy() colorMenu = nil end
-	if CONFIG.colors.uiOpen then
-		CONFIG.colors.uiOpen = false
-		if inFirstPerson() then
-			pcall(function() UserInputService.MouseBehavior = Enum.MouseBehavior.LockCenter end)
-		end
-	end
+	if CONFIG.colors.uiOpen then closeColorPanel(true) end
 	if chargeGui then chargeGui:Destroy() chargeGui = nil end
 	if speedGui then speedGui:Destroy() speedGui = nil end
 	if stickyTool and stickyTool.Parent then stickyTool:Destroy() end
@@ -3292,6 +3313,13 @@ RunService:BindToRenderStep("StickyLauncherAim", Enum.RenderPriority.Camera.Valu
 -- is what actually makes it stick.
 RunService:BindToRenderStep("StickyColorMouse", Enum.RenderPriority.Last.Value, function()
 	if CONFIG.colors.uiOpen then
+		-- Leaving first person (or losing the launcher) with the picker open has
+		-- to close it here, or it holds the cursor free for the rest of the
+		-- session with the panel aimed at your own back.
+		if not (stickyToolEquipped() and inFirstPerson()) then
+			closeColorPanel(true)
+			return
+		end
 		if UserInputService.MouseBehavior ~= Enum.MouseBehavior.Default then
 			pcall(function() UserInputService.MouseBehavior = Enum.MouseBehavior.Default end)
 		end
@@ -3333,7 +3361,11 @@ table.insert(globalConns, UserInputService.InputBegan:Connect(function(input, ga
 	-- guard because this place binds RightShift itself, so it always arrives
 	-- flagged as processed.
 	if input.KeyCode == Enum.KeyCode.RightShift then
-		toggleColorPanel()
+		-- Not while typing: this place binds RightShift itself, so chatting with
+		-- a capital letter in it would otherwise open the picker behind the chat.
+		if not UserInputService:GetFocusedTextBox() then
+			toggleColorPanel()
+		end
 		return
 	end
 
